@@ -21,6 +21,10 @@ make
 make install
 ```
 
+The build prefers static library archives when available, falling back to shared
+libraries otherwise. The C runtime uses the compiler's default linking mode.
+To use normal shared-library selection, run `make clean && make PREFER_STATIC=0`.
+
 Installation places `m2t` and the `g2t` symlink in `/usr/local/bin`. Use elevated
 privileges if needed, or install into your own directory:
 
