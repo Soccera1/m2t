@@ -249,7 +249,7 @@ class TableLayoutTests(unittest.TestCase):
         plain = run(source, "--no-ansi", "--width", "24")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(SGR.sub(b"", p.stdout), plain.stdout)
-        for code in [b"\x1b[1m", b"\x1b[3m", b"\x1b[33m", b"\x1b[36m"]:
+        for code in [b"\x1b[1m", b"\x1b[3m", b"\x1b[38;2;255;255;0m", b"\x1b[38;2;0;255;255m"]:
             self.assertIn(code, p.stdout)
         lines = plain.stdout.decode().strip().splitlines()
         self.assertTrue(all(len(line) <= 24 for line in lines))
@@ -317,9 +317,10 @@ class ExampleTests(unittest.TestCase):
                     self.assertIn(snippet, normalized)
                 self.assertNotIn("This hidden paragraph should not appear.", normalized)
                 self.assertNotIn('console.log("This script is omitted.")', normalized)
-                for code in [1, 3, 4, 9, 33, 34, 36]:
+                for code in [1, 3, 4, 9]:
                     self.assertIn(f"\x1b[{code}m".encode(), styled.stdout)
-                self.assertIn(b"\x1b[30;43m", styled.stdout)
+                for color in [b"38;2;255;255;0", b"38;2;0;0;255", b"38;2;0;255;255", b"48;2;255;255;0"]:
+                    self.assertIn(b"\x1b[" + color + b"m", styled.stdout)
                 self.assertIn("┌", plain.stdout.decode())
                 self.assertIn("└", plain.stdout.decode())
 

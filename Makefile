@@ -5,7 +5,7 @@ bindir ?= $(PREFIX)/bin
 DESTDIR ?=
 INSTALL ?= install
 PREFER_STATIC ?= 1
-PACKAGES := md4c-html lexbor
+PACKAGES := md4c-html lexbor libcss
 CPPFLAGS += $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
@@ -27,14 +27,17 @@ endif
 .PHONY: all clean test install uninstall
 all: m2t g2t
 
-m2t: m2t.o Makefile
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ m2t.o $(LDLIBS)
+m2t: m2t.o css.o Makefile
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ m2t.o css.o $(LDLIBS)
+
+m2t.o css.o: css.h
 
 g2t: m2t
 	ln -sf m2t g2t
 
 test: all
 	python3 tests/test_cli.py ./m2t
+	python3 tests/test_css.py ./m2t
 
 install: all
 	$(INSTALL) -d "$(DESTDIR)$(bindir)"
@@ -45,4 +48,4 @@ uninstall:
 	rm -f "$(DESTDIR)$(bindir)/g2t" "$(DESTDIR)$(bindir)/m2t"
 
 clean:
-	rm -f m2t g2t m2t.o
+	rm -f m2t g2t m2t.o css.o

@@ -9,10 +9,12 @@
 #include <string.h>
 #include <strings.h>
 #include <wchar.h>
+#include <wctype.h>
 
 #include <md4c-html.h>
 #include <lexbor/html/html.h>
 #include <lexbor/dom/interfaces/character_data.h>
+#include "css.h"
 
 typedef struct {
     char *data;
@@ -50,13 +52,18 @@ static void append(const MD_CHAR *s, MD_SIZE n, void *userdata)
     b->data[b->len] = '\0';
 }
 
-enum { BOLD = 1, ITALIC = 2, UNDERLINE = 4, STRIKE = 8, CODE = 16,
-       LINK = 32, HEADING = 64, MARK = 128 };
+enum { BOLD = 1, ITALIC = 2, UNDERLINE = 4, STRIKE = 8,
+       DIM = 16, OVERLINE = 32, BLINK = 64 };
 
 typedef struct {
     unsigned style;
+    css_color foreground, background;
+    const css_computed_style *computed;
+    const css_computed_style *first_base, *first_line, *first_letter;
+    size_t first_line_number, first_letter_number;
     size_t indent, quotes;
-    bool pre, verbatim;
+    bool pre, verbatim, nowrap, pre_line, hidden;
+    uint8_t transform;
 } Context;
 
 typedef struct {
@@ -64,22 +71,99 @@ typedef struct {
     FILE *out;
     bool ansi, pending_space, has_output, cell_mode, hard_wrap, failed;
     unsigned active_style;
-    size_t col, width, newlines;
+    css_color active_foreground, active_background;
+    size_t col, width, newlines, quote_depth, line_number, letter_number;
+    bool word_start;
 } Renderer;
 
-static void style(Renderer *r, unsigned bits)
+static void paint(Renderer *r, const Context *ctx)
 {
-    if (!r->ansi || r->active_style == bits) return;
+    unsigned bits = ctx->style;
+    if (!r->ansi || (r->active_style == bits && r->active_foreground == ctx->foreground &&
+                    r->active_background == ctx->background)) return;
     fputs("\033[0m", r->out);
     if (bits & BOLD) fputs("\033[1m", r->out);
+    if (bits & DIM) fputs("\033[2m", r->out);
     if (bits & ITALIC) fputs("\033[3m", r->out);
     if (bits & UNDERLINE) fputs("\033[4m", r->out);
     if (bits & STRIKE) fputs("\033[9m", r->out);
-    if (bits & CODE) fputs("\033[33m", r->out);
-    if (bits & LINK) fputs("\033[36m", r->out);
-    if (bits & HEADING) fputs("\033[34m", r->out);
-    if (bits & MARK) fputs("\033[30;43m", r->out);
+    if (bits & OVERLINE) fputs("\033[53m", r->out);
+    if (bits & BLINK) fputs("\033[5m", r->out);
+    if (ctx->foreground >> 24)
+        fprintf(r->out, "\033[38;2;%u;%u;%um", (ctx->foreground >> 16) & 255,
+                (ctx->foreground >> 8) & 255, ctx->foreground & 255);
+    if (ctx->background >> 24)
+        fprintf(r->out, "\033[48;2;%u;%u;%um", (ctx->background >> 16) & 255,
+                (ctx->background >> 8) & 255, ctx->background & 255);
     r->active_style = bits;
+    r->active_foreground = ctx->foreground;
+    r->active_background = ctx->background;
+}
+
+static void style(Renderer *r, unsigned bits)
+{
+    Context ctx = {.style = bits};
+    paint(r, &ctx);
+}
+
+static unsigned font_bits(const css_computed_style *s)
+{
+    unsigned bits = 0;
+    unsigned weight = css_computed_font_weight(s);
+    if (weight == CSS_FONT_WEIGHT_BOLD || weight == CSS_FONT_WEIGHT_BOLDER ||
+        weight >= CSS_FONT_WEIGHT_600) bits |= BOLD;
+    if (weight >= CSS_FONT_WEIGHT_100 && weight <= CSS_FONT_WEIGHT_300) bits |= DIM;
+    if (css_computed_font_style(s) != CSS_FONT_STYLE_NORMAL) bits |= ITALIC;
+    return bits;
+}
+
+static unsigned decoration_bits(const css_computed_style *s)
+{
+    unsigned bits = 0, d = css_computed_text_decoration(s);
+    if (d & CSS_TEXT_DECORATION_UNDERLINE) bits |= UNDERLINE;
+    if (d & CSS_TEXT_DECORATION_LINE_THROUGH) bits |= STRIKE;
+    if (d & CSS_TEXT_DECORATION_OVERLINE) bits |= OVERLINE;
+    if (d & CSS_TEXT_DECORATION_BLINK) bits |= BLINK;
+    return bits;
+}
+
+static void apply_css(Renderer *r, const css_computed_style *s)
+{
+    if (!s) return;
+    r->ctx.computed = s;
+    unsigned decorations = r->ctx.style & (UNDERLINE | STRIKE | OVERLINE | BLINK);
+    r->ctx.style = decorations | font_bits(s) | decoration_bits(s);
+    css_computed_color(s, &r->ctx.foreground);
+    css_color bg;
+    css_computed_background_color(s, &bg);
+    if (bg >> 24) r->ctx.background = bg;
+    unsigned ws = css_computed_white_space(s);
+    r->ctx.pre = ws == CSS_WHITE_SPACE_PRE;
+    r->ctx.verbatim = ws == CSS_WHITE_SPACE_PRE_WRAP;
+    r->ctx.pre_line = ws == CSS_WHITE_SPACE_PRE_LINE;
+    r->ctx.nowrap = ws == CSS_WHITE_SPACE_NOWRAP || ws == CSS_WHITE_SPACE_PRE;
+    r->ctx.hidden = css_computed_visibility(s) != CSS_VISIBILITY_VISIBLE;
+    r->ctx.transform = css_computed_text_transform(s);
+}
+
+static void pseudo_paint(Context *ctx, const css_computed_style *base,
+                          const css_computed_style *pseudo)
+{
+    if (!base || !pseudo) return;
+    css_color normal, special;
+    css_computed_color(base, &normal);
+    css_computed_color(pseudo, &special);
+    if (normal != special) ctx->foreground = special;
+    css_computed_background_color(base, &normal);
+    css_computed_background_color(pseudo, &special);
+    if (normal != special && special >> 24) ctx->background = special;
+    if (css_computed_font_weight(base) != css_computed_font_weight(pseudo))
+        ctx->style = (ctx->style & ~(BOLD | DIM)) | (font_bits(pseudo) & (BOLD | DIM));
+    if (css_computed_font_style(base) != css_computed_font_style(pseudo))
+        ctx->style = (ctx->style & ~ITALIC) | (font_bits(pseudo) & ITALIC);
+    ctx->style |= decoration_bits(pseudo);
+    if (css_computed_text_transform(base) != css_computed_text_transform(pseudo))
+        ctx->transform = css_computed_text_transform(pseudo);
 }
 
 static void newline(Renderer *r)
@@ -88,7 +172,9 @@ static void newline(Renderer *r)
     fputc('\n', r->out);
     r->col = 0;
     r->newlines++;
+    r->line_number++;
     r->pending_space = false;
+    r->word_start = true;
 }
 
 static void boundary(Renderer *r, size_t lines)
@@ -145,15 +231,38 @@ static bool space(unsigned char c)
 
 static void glyph(Renderer *r, const unsigned char *s, size_t n, uint32_t cp)
 {
-    if (r->hard_wrap && r->width &&
+    if ((r->hard_wrap || (r->ctx.verbatim && !r->ctx.nowrap)) && r->width &&
         r->col > r->ctx.indent + r->ctx.quotes * 2 &&
         r->col + char_width(cp) > r->width) newline(r);
     prefix(r);
-    style(r, r->ctx.style);
-    if (cp < 32 || (cp >= 0x7f && cp <= 0x9f) || cp == 0xfffd)
+    Context painted = r->ctx;
+    if (r->line_number == r->ctx.first_line_number)
+        pseudo_paint(&painted, r->ctx.first_base, r->ctx.first_line);
+    if (!iswspace((wint_t)cp) && r->letter_number == r->ctx.first_letter_number)
+        pseudo_paint(&painted, r->ctx.first_base, r->ctx.first_letter);
+    paint(r, &painted);
+    if (r->ctx.hidden) {
+        for (size_t i = 0; i < char_width(cp); i++) fputc(' ', r->out);
+    } else if (cp < 32 || (cp >= 0x7f && cp <= 0x9f) || cp == 0xfffd)
         fputs("�", r->out);
-    else
-        fwrite(s, 1, n, r->out);
+    else {
+        uint32_t transformed = cp;
+        if (painted.transform == CSS_TEXT_TRANSFORM_UPPERCASE ||
+            (painted.transform == CSS_TEXT_TRANSFORM_CAPITALIZE && r->word_start))
+            transformed = (uint32_t)towupper((wint_t)cp);
+        if (painted.transform == CSS_TEXT_TRANSFORM_LOWERCASE)
+            transformed = (uint32_t)towlower((wint_t)cp);
+        if (transformed == cp) fwrite(s, 1, n, r->out);
+        else {
+            char bytes[MB_LEN_MAX];
+            mbstate_t state = {0};
+            size_t len = wcrtomb(bytes, (wchar_t)transformed, &state);
+            if (len == (size_t)-1) fwrite(s, 1, n, r->out);
+            else { fwrite(bytes, 1, len, r->out); cp = transformed; }
+        }
+    }
+    r->word_start = iswspace((wint_t)cp) != 0;
+    if (!r->word_start) r->letter_number++;
     r->col += char_width(cp);
     r->newlines = 0;
     r->has_output = true;
@@ -161,7 +270,7 @@ static void glyph(Renderer *r, const unsigned char *s, size_t n, uint32_t cp)
 
 static void text(Renderer *r, const unsigned char *s, size_t n)
 {
-    if (r->ctx.verbatim && !r->ctx.pre && r->pending_space) {
+    if ((r->ctx.verbatim || r->ctx.pre) && r->pending_space) {
         if (r->col) glyph(r, (const unsigned char *)" ", 1, ' ');
         r->pending_space = false;
     }
@@ -176,6 +285,7 @@ static void text(Renderer *r, const unsigned char *s, size_t n)
                 continue;
             }
         } else {
+            if (r->ctx.pre_line && s[i] == '\n') { newline(r); i++; continue; }
             if (space(s[i])) { r->pending_space = true; i++; continue; }
             /* Wrap at whitespace, retaining long words and URLs intact. */
             size_t word_width = 0;
@@ -186,7 +296,7 @@ static void text(Renderer *r, const unsigned char *s, size_t n)
                 j += k;
             }
             if (r->pending_space && r->col) {
-                if (r->width && r->col + 1 + word_width > r->width) newline(r);
+                if (!r->ctx.nowrap && r->width && r->col + 1 + word_width > r->width) newline(r);
                 else glyph(r, (const unsigned char *)" ", 1, ' ');
             }
             r->pending_space = false;
@@ -224,6 +334,47 @@ static bool has_attribute(lxb_dom_node_t *node, const char *name)
                                          (const lxb_char_t *)name, strlen(name));
 }
 
+static void generated(Renderer *r, lxb_dom_node_t *node, css_pseudo_element pseudo)
+{
+    const css_computed_style *s = css_node_style(node, pseudo);
+    if (!s || css_computed_display_static(s) == CSS_DISPLAY_NONE) return;
+    const css_computed_content_item *items;
+    if (css_computed_content(s, &items) != CSS_CONTENT_SET || !items) return;
+    Context saved = r->ctx;
+    apply_css(r, s);
+    for (const css_computed_content_item *item = items;
+         item->type != CSS_COMPUTED_CONTENT_NONE; item++) {
+        if (item->type == CSS_COMPUTED_CONTENT_STRING) {
+            text(r, (const unsigned char *)lwc_string_data(item->data.string),
+                 lwc_string_length(item->data.string));
+        } else if (item->type == CSS_COMPUTED_CONTENT_ATTR) {
+            size_t len;
+            const unsigned char *value = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *)lwc_string_data(item->data.attr),
+                lwc_string_length(item->data.attr), &len);
+            if (value) text(r, value, len);
+        } else if (item->type == CSS_COMPUTED_CONTENT_OPEN_QUOTE ||
+                   item->type == CSS_COMPUTED_CONTENT_CLOSE_QUOTE) {
+            lwc_string **quotes;
+            css_computed_quotes(s, &quotes);
+            size_t pairs = 0;
+            if (quotes) while (quotes[pairs * 2] && quotes[pairs * 2 + 1]) pairs++;
+            bool closing = item->type == CSS_COMPUTED_CONTENT_CLOSE_QUOTE;
+            if (closing && r->quote_depth) r->quote_depth--;
+            size_t index = r->quote_depth < pairs ? r->quote_depth : pairs ? pairs - 1 : 0;
+            if (pairs) {
+                lwc_string *quote = quotes[index * 2 + closing];
+                text(r, (const unsigned char *)lwc_string_data(quote), lwc_string_length(quote));
+            }
+            if (!closing) r->quote_depth++;
+        } else if (item->type == CSS_COMPUTED_CONTENT_NO_OPEN_QUOTE) r->quote_depth++;
+        else if (item->type == CSS_COMPUTED_CONTENT_NO_CLOSE_QUOTE && r->quote_depth)
+            r->quote_depth--;
+    }
+    r->ctx = saved;
+}
+
 static long number_attr(lxb_dom_node_t *node, const char *name, long fallback)
 {
     size_t n;
@@ -257,6 +408,7 @@ typedef struct {
     lxb_dom_node_t *node;
     char *data;
     size_t len, pos;
+    css_color background;
     unsigned align; /* 0: left, 1: center, 2: right */
 } Cell;
 
@@ -293,9 +445,18 @@ static bool capture_cell(Renderer *r, Cell *cell, size_t width)
     FILE *stream = open_memstream(&cell->data, &cell->len);
     if (!stream) return false;
     Renderer inner = {
-        .ctx.style = r->ctx.style, .out = stream, .ansi = r->ansi,
-        .width = width, .hard_wrap = width != 0, .cell_mode = true
+        .ctx = r->ctx, .out = stream, .ansi = r->ansi,
+        .width = width, .hard_wrap = width != 0, .cell_mode = true, .word_start = true
     };
+    inner.ctx.indent = inner.ctx.quotes = 0;
+    inner.ctx.first_base = inner.ctx.first_line = inner.ctx.first_letter = NULL;
+    for (lxb_dom_node_t *n = cell->node; n; n = n->parent) {
+        const css_computed_style *s = css_node_style(n, CSS_PSEUDO_ELEMENT_NONE);
+        css_color background = 0;
+        if (s) css_computed_background_color(s, &background);
+        if (background >> 24) { inner.ctx.background = background; break; }
+    }
+    cell->background = inner.ctx.background;
     bool ok = render(&inner, cell->node);
     if (fclose(stream)) ok = false;
     while (cell->len && cell->data[cell->len - 1] == '\n') cell->len--;
@@ -307,7 +468,7 @@ static bool collect_row(Renderer *r, Row *row, lxb_dom_node_t *node)
     for (lxb_dom_node_t *c = node->first_child; c; c = c->next) {
         if (c->type != LXB_DOM_NODE_TYPE_ELEMENT ||
             (c->local_name != LXB_TAG_TD && c->local_name != LXB_TAG_TH) ||
-            has_attribute(c, "hidden")) continue;
+            css_node_omitted(c)) continue;
         if (!reserve((void **)&row->cells, &row->cap, row->count + 1,
                      sizeof(*row->cells))) return false;
         Cell *cell = &row->cells[row->count++];
@@ -318,6 +479,16 @@ static bool collect_row(Renderer *r, Row *row, lxb_dom_node_t *node)
             cell->align = 1;
         if (align && n == 5 && !strncasecmp((const char *)align, "right", n))
             cell->align = 2;
+        const css_computed_style *s = css_node_style(c, CSS_PSEUDO_ELEMENT_NONE);
+        if (s) {
+            unsigned alignment = css_computed_text_align(s);
+            if (alignment == CSS_TEXT_ALIGN_CENTER || alignment == CSS_TEXT_ALIGN_LIBCSS_CENTER)
+                cell->align = 1;
+            else if (alignment == CSS_TEXT_ALIGN_RIGHT || alignment == CSS_TEXT_ALIGN_LIBCSS_RIGHT)
+                cell->align = 2;
+            else if (alignment == CSS_TEXT_ALIGN_LEFT || alignment == CSS_TEXT_ALIGN_LIBCSS_LEFT)
+                cell->align = 0;
+        }
         if (!capture_cell(r, cell, 0)) return false;
     }
     return true;
@@ -347,7 +518,8 @@ static bool render_table(Renderer *r, lxb_dom_node_t *table)
     bool ok = false;
     /* Only inspect this table's rows, not rows of tables inside cells. */
     for (lxb_dom_node_t *group = table->first_child; group; group = group->next) {
-        if (group->type != LXB_DOM_NODE_TYPE_ELEMENT || has_attribute(group, "hidden"))
+        if (group->type != LXB_DOM_NODE_TYPE_ELEMENT ||
+            css_node_omitted(group))
             continue;
         if (group->local_name == LXB_TAG_CAPTION) {
             if (!render(r, group)) goto done;
@@ -360,7 +532,8 @@ static bool render_table(Renderer *r, lxb_dom_node_t *table)
         lxb_dom_node_t *node = section ? group->first_child : group;
         while (node) {
             if (node->type == LXB_DOM_NODE_TYPE_ELEMENT &&
-                node->local_name == LXB_TAG_TR && !has_attribute(node, "hidden")) {
+                node->local_name == LXB_TAG_TR &&
+                !css_node_omitted(node)) {
                 if (!reserve((void **)&rows, &cap, count + 1, sizeof(*rows))) goto done;
                 Row *row = &rows[count++];
                 *row = (Row){0};
@@ -429,14 +602,18 @@ static bool render_table(Renderer *r, lxb_dom_node_t *table)
                 size_t pad = widths[j] - w;
                 size_t before = cell && cell->align == 2 ? pad :
                                 cell && cell->align == 1 ? pad / 2 : 0;
+                css_color table_background = r->ctx.background;
+                if (cell) r->ctx.background = cell->background;
                 table_spaces(r, before + 1);
                 if (cell) {
+                    style(r, 0);
                     fwrite(cell->data + start, 1, end - start, r->out);
                     r->col += w;
                     cell->pos = end < cell->len ? end + 1 : end;
                     if (cell->pos < cell->len) more = true;
                 }
                 table_spaces(r, pad - before + 1);
+                r->ctx.background = table_background;
                 literal(r, "│");
             }
             newline(r);
@@ -478,7 +655,8 @@ static bool enter(Renderer *r, Frame *stack, size_t depth)
     if (tag == LXB_TAG_HEAD || tag == LXB_TAG_SCRIPT || tag == LXB_TAG_STYLE ||
         tag == LXB_TAG_TEMPLATE || tag == LXB_TAG_TITLE) return false;
     size_t len;
-    if (has_attribute(node, "hidden")) return false;
+    if (css_node_omitted(node)) return false;
+    apply_css(r, css_node_style(node, CSS_PSEUDO_ELEMENT_NONE));
     /* A loose list's first paragraph follows the marker on the same line. */
     bool first_list_paragraph = tag == LXB_TAG_P && node->parent &&
         node->parent->local_name == LXB_TAG_LI;
@@ -501,30 +679,18 @@ static bool enter(Renderer *r, Frame *stack, size_t depth)
     switch (tag) {
     case LXB_TAG_TABLE:
         if (!r->cell_mode) {
+            generated(r, node, CSS_PSEUDO_ELEMENT_BEFORE);
             if (!render_table(r, node)) r->failed = true;
+            generated(r, node, CSS_PSEUDO_ELEMENT_AFTER);
             return false;
         }
         break;
     case LXB_TAG_H1: case LXB_TAG_H2: case LXB_TAG_H3:
     case LXB_TAG_H4: case LXB_TAG_H5: case LXB_TAG_H6:
         boundary(r, 2);
-        r->ctx.style |= BOLD | HEADING;
-        break;
-    case LXB_TAG_STRONG: case LXB_TAG_B: r->ctx.style |= BOLD; break;
-    case LXB_TAG_EM: case LXB_TAG_I: case LXB_TAG_CITE:
-    case LXB_TAG_VAR: r->ctx.style |= ITALIC; break;
-    case LXB_TAG_U: case LXB_TAG_INS: r->ctx.style |= UNDERLINE; break;
-    case LXB_TAG_DEL: case LXB_TAG_S: case LXB_TAG_STRIKE:
-        r->ctx.style |= STRIKE; break;
-    case LXB_TAG_MARK: r->ctx.style |= MARK; break;
-    case LXB_TAG_CODE: case LXB_TAG_KBD: case LXB_TAG_SAMP:
-        r->ctx.style |= CODE;
-        r->ctx.verbatim = true;
         break;
     case LXB_TAG_PRE:
         boundary(r, 2);
-        r->ctx.pre = true;
-        r->ctx.style |= CODE;
         r->ctx.indent += 4;
         break;
     case LXB_TAG_BLOCKQUOTE:
@@ -548,22 +714,32 @@ static bool enter(Renderer *r, Frame *stack, size_t depth)
         char marker[64] = "• ";
         for (size_t i = depth - 1; i > 0; i--) {
             Frame *parent = &stack[i - 1];
-            if (parent->node->local_name == LXB_TAG_OL) {
+            if (parent->node->local_name == LXB_TAG_OL || parent->node->local_name == LXB_TAG_UL) {
                 parent->ordinal = number_attr(node, "value", parent->ordinal);
-                snprintf(marker, sizeof(marker), "%ld. ", parent->ordinal);
+                const css_computed_style *s = r->ctx.computed;
+                if (s && css_computed_list_style_type(s) == CSS_LIST_STYLE_TYPE_NONE) {
+                    marker[0] = '\0';
+                } else if (s && parent->ordinal >= INT_MIN && parent->ordinal <= INT_MAX) {
+                    size_t len;
+                    if (css_computed_format_list_style(s, (int)parent->ordinal, marker,
+                                                        sizeof(marker) - 2, &len) == CSS_OK &&
+                        len < sizeof(marker) - 2) {
+                        marker[len] = '\0';
+                        if (len && marker[len - 1] != ' ') strcat(marker, " ");
+                    }
+                } else snprintf(marker, sizeof(marker), "%ld. ", parent->ordinal);
                 if ((parent->step > 0 && parent->ordinal < LONG_MAX) ||
                     (parent->step < 0 && parent->ordinal > LONG_MIN))
                     parent->ordinal += parent->step;
                 break;
             }
-            if (parent->node->local_name == LXB_TAG_UL) break;
         }
         prefix(r);
         size_t marker_start = r->col;
         literal(r, marker);
         r->pending_space = false;
         /* literal() defers trailing whitespace; emit the marker's space. */
-        glyph(r, (const unsigned char *)" ", 1, ' ');
+        if (*marker) glyph(r, (const unsigned char *)" ", 1, ' ');
         r->ctx.indent += r->col - marker_start;
         break;
     }
@@ -574,7 +750,6 @@ static bool enter(Renderer *r, Frame *stack, size_t depth)
         literal(r, "────────────────────");
         boundary(r, 2);
         break;
-    case LXB_TAG_A: r->ctx.style |= LINK | UNDERLINE; break;
     case LXB_TAG_INPUT: {
         const unsigned char *type = attribute(node, "type", &len);
         if (type && len == 8 && !strncasecmp((const char *)type, "checkbox", len))
@@ -598,10 +773,20 @@ static bool enter(Renderer *r, Frame *stack, size_t depth)
                 break;
             }
         }
-        if (tag == LXB_TAG_TH) r->ctx.style |= BOLD;
         break;
     default: break;
     }
+    const css_computed_style *s = r->ctx.computed;
+    if (s && (css_computed_display_static(s) == CSS_DISPLAY_BLOCK ||
+              css_computed_display_static(s) == CSS_DISPLAY_LIST_ITEM ||
+              css_computed_display_static(s) == CSS_DISPLAY_TABLE_CELL)) {
+        r->ctx.first_base = s;
+        r->ctx.first_line = css_node_style(node, CSS_PSEUDO_ELEMENT_FIRST_LINE);
+        r->ctx.first_letter = css_node_style(node, CSS_PSEUDO_ELEMENT_FIRST_LETTER);
+        r->ctx.first_line_number = r->line_number;
+        r->ctx.first_letter_number = r->letter_number;
+    }
+    generated(r, node, CSS_PSEUDO_ELEMENT_BEFORE);
     return true;
 }
 
@@ -610,11 +795,12 @@ static void leave(Renderer *r, Frame *f)
     lxb_dom_node_t *node = f->node;
     if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
         uintptr_t tag = node->local_name;
+        generated(r, node, CSS_PSEUDO_ELEMENT_AFTER);
         if (tag == LXB_TAG_A) {
             size_t n;
             const unsigned char *href = attribute(node, "href", &n);
             if (href && n) {
-                r->ctx.style = f->saved.style;
+                r->ctx = f->saved;
                 literal(r, " (");
                 text(r, href, n);
                 literal(r, ")");
@@ -678,7 +864,7 @@ static void usage(FILE *out)
 int main(int argc, char **argv)
 {
     setlocale(LC_CTYPE, "");
-    Renderer renderer = {.out = stdout, .ansi = true, .width = 80};
+    Renderer renderer = {.out = stdout, .ansi = true, .width = 80, .word_start = true};
     const char *program = strrchr(argv[0], '/');
     program = program ? program + 1 : argv[0];
     bool github = !strcmp(program, "g2t");
@@ -725,6 +911,7 @@ int main(int argc, char **argv)
     if (in != stdin && fclose(in)) read_failed = true;
     const char *error = NULL;
     lxb_html_document_t *doc = NULL;
+    CssDocument *css = NULL;
     if (read_failed) { error = "failed to read input"; goto done; }
     if (input.failed || input.len > UINT_MAX) { error = "input too large or out of memory"; goto done; }
     /* Markdown owns the syntax. Only its raw HTML is passed through;
@@ -741,9 +928,12 @@ int main(int argc, char **argv)
         error = "HTML parsing failed or out of memory";
         goto done;
     }
+    css = css_document_create(lxb_dom_interface_node(doc), path, renderer.width, renderer.ansi);
+    if (!css) { error = "CSS parsing or selection failed"; goto done; }
     if (!render(&renderer, lxb_dom_interface_node(doc))) error = "out of memory";
     if (fflush(stdout) || ferror(stdout)) error = "failed to write output";
 done:
+    css_document_destroy(css);
     if (doc) lxb_html_document_destroy(doc);
     free(input.data);
     free(html.data);

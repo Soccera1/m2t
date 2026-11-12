@@ -13,8 +13,10 @@ Requires a C11 compiler, Make, pkg-config, and development packages for:
 
 - [MD4C](https://github.com/mity/md4c), including its HTML renderer
 - [Lexbor](https://lexbor.com/modules/html/)
+- [libcss](https://www.netsurf-browser.org/projects/libcss/), with LibParserUtils
+  and LibWapcaplet
 
-Both libraries are required for either Markdown mode.
+These libraries are required for either Markdown mode.
 
 ```sh
 make
@@ -65,6 +67,7 @@ Try the included examples directly from the build directory:
 ```sh
 ./m2t examples/commonmark-html5.md
 ./g2t examples/gfm-html5.md
+./m2t examples/css-html5.md
 ```
 
 ## Markdown and HTML
@@ -72,16 +75,40 @@ Try the included examples directly from the build directory:
 MD4C parses both modes, using its GitHub dialect for GFM. The resulting HTML
 passes through Lexbor before rendering. Markdown gets first interpretation, so
 autolinks work and HTML inside code stays literal. Following CommonMark rules,
-Markdown inside a raw HTML block stays literal until that block ends. Both modes pass raw HTML
-to Lexbor; MD4C does not apply GFM's disallowed-tag filter.
+Markdown inside a raw HTML block stays literal until that block ends. Both modes
+pass raw HTML to Lexbor; MD4C does not apply GFM's disallowed-tag filter.
 MD4C accepts both single and double tildes for strikethrough in GFM mode.
 
 Tables have borders, aligned columns, and wrapped multiline cells. Links show
 their destinations, images show their alt text, and task checkboxes appear as
 `[x]` or `[ ]`.
 
-CSS, JavaScript, external resources, and image pixels are not rendered. Hidden
-elements, scripts, styles, templates, and document metadata are omitted.
+## CSS
+
+libcss handles selectors, specificity, inheritance, `!important`, shorthands,
+and media queries. Styles come from `style` attributes, `<style>` blocks, and
+local `<link rel="stylesheet">` files, including relative `@import`s. File paths
+resolve relative to the document or stylesheet; stdin uses the current directory.
+Network stylesheets are not fetched. Media queries use a screen viewport with
+8 CSS pixels per column and a height of 384 pixels.
+
+The terminal renderer applies:
+
+- Foreground and background colours as 24-bit RGB ANSI sequences.
+- Bold, faint, italic/oblique, underline, overline, strikethrough, and blink.
+- Whitespace modes, text transforms, `display: none`, and `visibility`.
+- List marker styles, table cell alignment, and generated strings, attributes,
+  and quotation marks from `::before` / `::after`.
+- Text styling for `::first-line` and `::first-letter` when selected by libcss.
+
+Other properties are parsed and computed but have no terminal rendering effect.
+This includes graphical layout, fonts and font sizes, images, opacity, and alpha
+blending. Nonzero-alpha colours use their RGB channels. Interactive pseudo-classes
+such as `:hover` and `:visited` do not match. Italics, overlines, and blinking also
+depend on terminal support. `--no-ansi` removes paint while retaining text effects.
+
+JavaScript and image pixels are not rendered. Hidden elements, scripts, stylesheet
+text, templates, and document metadata are omitted.
 Merged table cells render as individual cells; nested tables use a simplified
 layout. Tables may exceed the requested width when their minimum layout cannot
 fit. Input control characters are filtered before terminal output.
