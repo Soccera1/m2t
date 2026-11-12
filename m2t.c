@@ -15,6 +15,7 @@
 #include <lexbor/html/html.h>
 #include <lexbor/dom/interfaces/character_data.h>
 #include "css.h"
+#include "images.h"
 
 typedef struct {
     char *data;
@@ -69,6 +70,7 @@ typedef struct {
 typedef struct {
     Context ctx;
     FILE *out;
+    Images *images;
     bool ansi, pending_space, has_output, cell_mode, hard_wrap, failed;
     unsigned active_style;
     css_color active_foreground, active_background;
@@ -386,6 +388,96 @@ static long number_attr(lxb_dom_node_t *node, const char *name, long fallback)
     errno = 0;
     long v = strtol(buf, &end, 10);
     return errno || end == buf || *end ? fallback : v;
+}
+
+static unsigned image_dimension(lxb_dom_node_t *node, const char *name, bool width)
+{
+    long attribute_size = number_attr(node, name, 0);
+    unsigned size = attribute_size > 0 && (unsigned long)attribute_size <= UINT_MAX ?
+                    (unsigned)attribute_size : 0;
+    const css_computed_style *s = css_node_style(node, CSS_PSEUDO_ELEMENT_NONE);
+    css_fixed length;
+    css_unit unit;
+    if (s) {
+        unsigned status = width ? css_computed_width(s, &length, &unit) :
+                                  css_computed_height(s, &length, &unit);
+        if (status == CSS_WIDTH_SET && unit == CSS_UNIT_PX && length > 0)
+            size = FIXTOINT(length) > 0 ? (unsigned)FIXTOINT(length) : 1;
+    }
+    return size;
+}
+
+static void image_placeholder(Renderer *r, lxb_dom_node_t *node, unsigned columns)
+{
+    size_t len;
+    const unsigned char *label = attribute(node, "alt", &len);
+    size_t start = 0;
+    while (label && start < len && space(label[start])) start++;
+    if (!label || start == len) {
+        label = (const unsigned char *)"[image]";
+        len = 7;
+        start = 0;
+    }
+    size_t width = 0;
+    bool gap = false;
+    for (size_t i = start; i < len;) {
+        if (space(label[i])) { gap = width != 0; i++; continue; }
+        uint32_t cp;
+        size_t n = decode(label + i, len - i, &cp);
+        size_t w = char_width(cp);
+        if (gap) {
+            if (width + 1 >= columns) { literal(r, "…"); break; }
+            glyph(r, (const unsigned char *)" ", 1, ' ');
+            width++;
+            gap = false;
+        }
+        if (width + w > columns || (width + w == columns && i + n < len)) {
+            if (width < columns) literal(r, "…");
+            break;
+        }
+        glyph(r, label + i, n, cp);
+        width += w;
+        i += n;
+    }
+}
+
+static bool render_image(Renderer *r, lxb_dom_node_t *node)
+{
+    if (!r->images || !r->ansi || r->cell_mode || r->ctx.hidden || r->out != stdout) return false;
+    size_t len;
+    const unsigned char *source = attribute(node, "src", &len);
+    if (!source || !len) return false;
+    char *path = strndup((const char *)source, len);
+    if (!path) return false;
+    ImageSlot slot;
+    size_t inset = r->ctx.indent + r->ctx.quotes * 2;
+    bool queued = image_queue(r->images, path, r->width, inset,
+        image_dimension(node, "width", true), image_dimension(node, "height", false),
+        r->ctx.background, &slot);
+    free(path);
+    if (!queued) return false;
+    boundary(r, 1);
+    style(r, 0);
+    /* Reserve the final area without waiting for image metadata. A transparent
+     * KGP anchor will track it through subsequent scrolling and scrollback. */
+    for (unsigned i = 1; i < slot.rows; i++) fputs("\r\n", r->out);
+    if (slot.rows > 1) fprintf(r->out, "\033[%uA", slot.rows - 1);
+    fputc('\r', r->out);
+    r->col = 0;
+    for (unsigned i = 0; i < slot.rows; i++) {
+        prefix(r);
+        if (!i) image_placeholder(r, node, slot.columns);
+        if (i + 1 < slot.rows) { newline(r); fputc('\r', r->out); }
+    }
+    if (slot.rows > 1) fprintf(r->out, "\033[%uA", slot.rows - 1);
+    fprintf(r->out, "\033[%zuG", inset + 1);
+    if (!image_anchor(r->images, r->out, &slot)) r->failed = true;
+    if (slot.rows > 1) fprintf(r->out, "\033[%uB", slot.rows - 1);
+    fputc('\r', r->out);
+    r->col = r->newlines = 0;
+    r->has_output = true;
+    newline(r);
+    return true;
 }
 
 static bool block(uintptr_t tag)
@@ -757,10 +849,15 @@ static bool enter(Renderer *r, Frame *stack, size_t depth)
         return false;
     }
     case LXB_TAG_IMG: {
-        literal(r, "[image: ");
+        if (render_image(r, node)) return false;
         const unsigned char *alt = attribute(node, "alt", &len);
-        if (alt) text(r, alt, len);
-        literal(r, "]");
+        size_t start = 0;
+        while (alt && start < len && space(alt[start])) start++;
+        if (alt && start < len) {
+            literal(r, "[image: ");
+            text(r, alt, len);
+            literal(r, "]");
+        } else literal(r, "[image]");
         return false;
     }
     case LXB_TAG_TR: boundary(r, 1); break;
@@ -855,9 +952,11 @@ static bool render(Renderer *r, lxb_dom_node_t *root)
 
 static void usage(FILE *out)
 {
-    fputs("Usage: m2t [-g|--github] [--no-ansi] [--width N] [FILE|-]\n"
+    fputs("Usage: m2t [-g|--github] [--no-ansi] [--width N] [--images MODE] [FILE|-]\n"
           "Render CommonMark and embedded HTML5 to an ANSI terminal.\n"
           "Use -g, --github, or invoke as g2t for GitHub Flavored Markdown.\n"
+          "Images: auto (detect Kitty graphics), always, or never. Default: auto.\n"
+          "--image-timeout N sets the image load deadline in seconds (default: 10).\n"
           "Read stdin when FILE is omitted or '-'. Width 0 disables wrapping.\n", out);
 }
 
@@ -869,6 +968,8 @@ int main(int argc, char **argv)
     program = program ? program + 1 : argv[0];
     bool github = !strcmp(program, "g2t");
     const char *path = NULL;
+    ImageMode image_mode = IMAGES_AUTO;
+    unsigned image_timeout = 10;
     bool options = true;
     for (int i = 1; i < argc; i++) {
         if (options && !strcmp(argv[i], "--")) { options = false; continue; }
@@ -877,6 +978,34 @@ int main(int argc, char **argv)
             return 0;
         }
         if (options && !strcmp(argv[i], "--no-ansi")) { renderer.ansi = false; continue; }
+        if (options && !strcmp(argv[i], "--no-images")) { image_mode = IMAGES_NEVER; continue; }
+        if (options && (!strcmp(argv[i], "--image-timeout") ||
+                        !strncmp(argv[i], "--image-timeout=", 16))) {
+            const char *value;
+            if (!strcmp(argv[i], "--image-timeout")) {
+                if (++i == argc) goto bad_args;
+                value = argv[i];
+            } else value = argv[i] + 16;
+            char *end;
+            if (!*value || *value == '-') goto bad_args;
+            errno = 0;
+            unsigned long n = strtoul(value, &end, 10);
+            if (errno || *end || !n || n > 3600) goto bad_args;
+            image_timeout = (unsigned)n;
+            continue;
+        }
+        if (options && (!strcmp(argv[i], "--images") || !strncmp(argv[i], "--images=", 9))) {
+            const char *mode;
+            if (!strcmp(argv[i], "--images")) {
+                if (++i == argc) goto bad_args;
+                mode = argv[i];
+            } else mode = argv[i] + 9;
+            if (!strcmp(mode, "auto")) image_mode = IMAGES_AUTO;
+            else if (!strcmp(mode, "always")) image_mode = IMAGES_ALWAYS;
+            else if (!strcmp(mode, "never")) image_mode = IMAGES_NEVER;
+            else goto bad_args;
+            continue;
+        }
         if (options && (!strcmp(argv[i], "-g") || !strcmp(argv[i], "--github"))) {
             github = true;
             continue;
@@ -930,9 +1059,13 @@ int main(int argc, char **argv)
     }
     css = css_document_create(lxb_dom_interface_node(doc), path, renderer.width, renderer.ansi);
     if (!css) { error = "CSS parsing or selection failed"; goto done; }
+    renderer.images = images_create(path, renderer.ansi ? image_mode : IMAGES_NEVER, image_timeout);
+    if (!renderer.images) { error = "out of memory"; goto done; }
     if (!render(&renderer, lxb_dom_interface_node(doc))) error = "out of memory";
     if (fflush(stdout) || ferror(stdout)) error = "failed to write output";
+    if (!error && !images_finish(renderer.images, stdout)) error = "failed to write image output";
 done:
+    images_destroy(renderer.images);
     css_document_destroy(css);
     if (doc) lxb_html_document_destroy(doc);
     free(input.data);

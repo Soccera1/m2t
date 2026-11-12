@@ -11,7 +11,9 @@ This starts on a new line.
 
 Here is an [inline link](https://example.com), a [reference link][example],
 and a CommonMark autolink: <https://example.com/docs>.
-An image renders its alternative text: ![A small mountain landscape](mountains.png).
+Images use graphics where available, with alternative text as a fallback:
+
+![A small mountain landscape](mountains.png)
 
 [example]: https://example.com/reference "An example reference"
 

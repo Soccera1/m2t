@@ -15,6 +15,7 @@ Requires a C11 compiler, Make, pkg-config, and development packages for:
 - [Lexbor](https://lexbor.com/modules/html/)
 - [libcss](https://www.netsurf-browser.org/projects/libcss/), with LibParserUtils
   and LibWapcaplet
+- stb headers (`stb_image.h`), libwebp, and libcurl for images
 
 These libraries are required for either Markdown mode.
 
@@ -55,6 +56,9 @@ With no file argument, or with `-`, input comes from stdin.
 | `-g`, `--github` | Use GitHub Flavored Markdown |
 | `--width N` | Wrap at N columns (default: 80); `0` disables wrapping |
 | `--no-ansi` | Output plain text |
+| `--images MODE` | Image output: `auto` (default), `always`, or `never` |
+| `--no-images` | Keep image alt text instead of graphics |
+| `--image-timeout N` | Image load deadline in seconds (default: 10) |
 | `-h`, `--help` | Show usage |
 | `--` | End options, allowing filenames that start with `-` |
 
@@ -80,8 +84,41 @@ pass raw HTML to Lexbor; MD4C does not apply GFM's disallowed-tag filter.
 MD4C accepts both single and double tildes for strikethrough in GFM mode.
 
 Tables have borders, aligned columns, and wrapped multiline cells. Links show
-their destinations, images show their alt text, and task checkboxes appear as
+their destinations, images fall back to their alt text, and task checkboxes appear as
 `[x]` or `[ ]`.
+
+## Images
+
+On terminals supporting the [Kitty Graphics Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/),
+image loading runs in the background while the document renders. Each image
+initially shows its alt text, or `[image]` if no alt text is provided. Once the
+text is complete, images fill their reserved areas as they become ready, even
+if those areas have scrolled into scrollback. Failed or timed-out loads keep
+the text placeholder.
+
+Placeholders use the available width and eight rows by default, capped to the
+terminal height. An HTML/CSS pixel height hint adjusts the reserved height.
+Long alt labels are clipped to one line. Loaded images preserve their aspect
+ratio and are centered within the reserved area; later text does not move.
+
+Detection checks KGP relative placements, which keep deferred images anchored
+to their original locations. Terminals without that feature, and redirected
+output, retain alt text. `--images always` skips the support check, and
+`--no-images` disables graphics. `--no-ansi` always disables graphics too.
+
+PNG, JPEG, GIF (first frame), WebP, and other stb raster formats are supported.
+Sources can be local files, HTTP(S) URLs, or image data URLs. Local paths resolve
+relative to the input document, or the current directory for stdin. Numeric HTML
+`width` / `height` and CSS pixel dimensions provide size hints. Images in tables,
+missing files, unsupported formats such as SVG, and failed downloads use alt text.
+
+Image downloads happen only when graphics output is enabled. Four workers load
+images concurrently. Each source is limited to 64 MiB and decoded images to
+16 megapixels. The load deadline includes queue time; change it with
+`--image-timeout N` (1–3600 seconds). Transparent images use a CSS or queried
+terminal background behind them, falling back to black when neither is known.
+In tmux, graphics commands use passthrough, which must be enabled in tmux's
+configuration.
 
 ## CSS
 
@@ -102,12 +139,12 @@ The terminal renderer applies:
 - Text styling for `::first-line` and `::first-letter` when selected by libcss.
 
 Other properties are parsed and computed but have no terminal rendering effect.
-This includes graphical layout, fonts and font sizes, images, opacity, and alpha
+This includes graphical layout, fonts and font sizes, CSS background images, opacity, and alpha
 blending. Nonzero-alpha colours use their RGB channels. Interactive pseudo-classes
 such as `:hover` and `:visited` do not match. Italics, overlines, and blinking also
 depend on terminal support. `--no-ansi` removes paint while retaining text effects.
 
-JavaScript and image pixels are not rendered. Hidden elements, scripts, stylesheet
+JavaScript is not executed. Hidden elements, scripts, stylesheet
 text, templates, and document metadata are omitted.
 Merged table cells render as individual cells; nested tables use a simplified
 layout. Tables may exceed the requested width when their minimum layout cannot
